@@ -21,7 +21,7 @@ import (
 	"fidl/fuchsia/netstack"
 	"fidl/fuchsia/wlan/service"
 
-	"github.com/google/netstack/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"github.com/pkg/errors"
 )
 

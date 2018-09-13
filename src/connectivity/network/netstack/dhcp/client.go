@@ -14,12 +14,12 @@ import (
 
 	"syslog"
 
-	"github.com/google/netstack/rand"
-	"github.com/google/netstack/tcpip"
-	tcpipHeader "github.com/google/netstack/tcpip/header"
-	"github.com/google/netstack/tcpip/network/ipv4"
-	"github.com/google/netstack/tcpip/stack"
-	"github.com/google/netstack/waiter"
+	"gvisor.dev/gvisor/pkg/rand"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	tcpipHeader "gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"github.com/pkg/errors"
 )
 

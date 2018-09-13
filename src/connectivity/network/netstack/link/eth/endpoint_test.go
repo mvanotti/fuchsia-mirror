@@ -15,9 +15,9 @@ import (
 	"fidl/fuchsia/hardware/ethernet"
 	ethernetext "fidlext/fuchsia/hardware/ethernet"
 
-	"github.com/google/netstack/tcpip"
-	"github.com/google/netstack/tcpip/buffer"
-	"github.com/google/netstack/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type deliverNetworkPacketArgs struct {

@@ -8,7 +8,7 @@ package util
 import (
 	"net"
 
-	"github.com/google/netstack/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
 func IsAny(a tcpip.Address) bool {

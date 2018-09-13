@@ -16,9 +16,9 @@ import (
 	"syslog"
 
 	inspect "fidl/fuchsia/inspect/deprecated"
-	"github.com/google/netstack/tcpip"
-	"github.com/google/netstack/tcpip/header"
-	"github.com/google/netstack/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // An infallible version of fuchsia.inspect.Inspect with FIDL details omitted.
