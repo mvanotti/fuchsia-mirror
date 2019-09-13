@@ -8,14 +8,19 @@ use crate::{
     view::{ViewAssistantPtr, ViewController, ViewKey},
 };
 use failure::{bail, format_err, Error, ResultExt};
-use fidl::endpoints::{create_endpoints, create_proxy};
+use fidl::endpoints::{create_endpoints, create_proxy, ClientEnd};
+use fidl_fuchsia_sysmem::{
+    AllocatorMarker, BufferCollectionConstraints, BufferCollectionMarker, BufferCollectionProxy,
+    BufferCollectionTokenMarker, BufferMemoryConstraints, BufferUsage, ColorSpace, ColorSpaceType,
+    FormatModifier, HeapType, ImageFormatConstraints, PixelFormat, PixelFormatType,
+};
 use fidl_fuchsia_ui_app::{ViewProviderRequest, ViewProviderRequestStream};
 use fidl_fuchsia_ui_policy::PresenterMarker;
 use fidl_fuchsia_ui_scenic::{ScenicMarker, ScenicProxy, SessionListenerRequest};
 use fidl_fuchsia_ui_views::ViewToken;
 use fuchsia_async::{self as fasync, DurationExt, Timer};
 use fuchsia_component::{self as component, client::connect_to_service};
-use fuchsia_framebuffer::{Frame, FrameBuffer, VSyncMessage};
+use fuchsia_framebuffer::{Frame, FrameBuffer, ImageFrame, VSyncMessage};
 use fuchsia_scenic::{Session, SessionPtr, ViewTokenPair};
 use fuchsia_zircon::{self as zx, DurationNum};
 use futures::{
@@ -43,6 +48,9 @@ pub enum ViewMode {
     /// This app's views do all of their rendering with a Canvas and Carnelian should
     /// take care of creating such a canvas for view created by this app.
     Canvas,
+    /// This app's views requires an image pipe and Carnelian should
+    /// take care of creating a buffer collection for view created by this app.
+    ImagePipe,
 }
 
 /// Trait that a mod author must implement. Currently responsible for creating
@@ -72,6 +80,18 @@ pub trait AppAssistant {
     fn create_view_assistant_canvas(&mut self, _: ViewKey) -> Result<ViewAssistantPtr, Error> {
         failure::bail!(
             "Assistant has ViewMode::Canvas but doesn't implement create_view_assistant_canvas."
+        )
+    }
+
+    /// Called when the Fuchsia view system requests that a view be created for
+    /// apps running in ViewMode::ImagePipe.
+    fn create_view_assistant_image_pipe(
+        &mut self,
+        _: ViewKey,
+        _: ClientEnd<BufferCollectionTokenMarker>,
+    ) -> Result<ViewAssistantPtr, Error> {
+        failure::bail!(
+            "Assistant has ViewMode::ImagePipe but doesn't implement create_view_assistant_image_pipe."
         )
     }
 
@@ -111,14 +131,87 @@ trait AppStrategy {
     fn get_pixel_size(&self) -> u32;
     fn get_pixel_format(&self) -> fuchsia_framebuffer::PixelFormat;
     fn get_linear_stride_bytes(&self) -> u32;
+    fn allocate_buffer_collection(
+        &mut self,
+        _executor: &mut fasync::Executor,
+    ) -> Result<Option<ClientEnd<BufferCollectionTokenMarker>>, Error> {
+        Ok(None)
+    }
+    fn present(&mut self, _executor: &mut fasync::Executor) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 type AppStrategyPtr = Box<dyn AppStrategy>;
+
+const IMAGE_FORMAT_CONSTRAINTS_DEFAULT: ImageFormatConstraints = ImageFormatConstraints {
+    pixel_format: PixelFormat {
+        type_: PixelFormatType::R8G8B8A8,
+        has_format_modifier: false,
+        format_modifier: FormatModifier { value: 0 },
+    },
+    color_spaces_count: 0,
+    color_space: [ColorSpace { type_: ColorSpaceType::Invalid }; 32],
+    min_coded_width: 0,
+    max_coded_width: 0,
+    min_coded_height: 0,
+    max_coded_height: 0,
+    min_bytes_per_row: 0,
+    max_bytes_per_row: 0,
+    max_coded_width_times_coded_height: 0,
+    layers: 0,
+    coded_width_divisor: 0,
+    coded_height_divisor: 0,
+    bytes_per_row_divisor: 0,
+    start_offset_divisor: 0,
+    display_width_divisor: 0,
+    display_height_divisor: 0,
+    required_min_coded_width: 0,
+    required_max_coded_width: 0,
+    required_min_coded_height: 0,
+    required_max_coded_height: 0,
+    required_min_bytes_per_row: 0,
+    required_max_bytes_per_row: 0,
+};
+
+const BUFFER_MEMORY_CONSTRAINTS_DEFAULT: BufferMemoryConstraints = BufferMemoryConstraints {
+    min_size_bytes: 0,
+    max_size_bytes: std::u32::MAX,
+    physically_contiguous_required: false,
+    secure_required: false,
+    ram_domain_supported: true,
+    cpu_domain_supported: true,
+    inaccessible_domain_supported: true,
+    heap_permitted_count: 0,
+    heap_permitted: [HeapType::SystemRam; 32],
+};
+
+const BUFFER_COLLECTION_CONSTRAINTS_DEFAULT: BufferCollectionConstraints =
+    BufferCollectionConstraints {
+        usage: BufferUsage { none: 0, cpu: 0, vulkan: 0, display: 1, video: 0 },
+        min_buffer_count_for_camping: 0,
+        min_buffer_count_for_dedicated_slack: 0,
+        min_buffer_count_for_shared_slack: 0,
+        min_buffer_count: 1, // TODO: double buffering.
+        max_buffer_count: 0,
+        has_buffer_memory_constraints: false,
+        buffer_memory_constraints: BUFFER_MEMORY_CONSTRAINTS_DEFAULT,
+        image_format_constraints_count: 0,
+        image_format_constraints: [IMAGE_FORMAT_CONSTRAINTS_DEFAULT; 32],
+    };
+
+const BUFFER_COLLECTION_ID: u64 = 1;
 
 struct FrameBufferAppStrategy {
     #[allow(unused)]
     frame_buffer: FrameBuffer,
     frame: Frame,
+    #[allow(unused)]
+    image_frame: Option<ImageFrame>,
+    #[allow(unused)]
+    buffer_collection_proxy: Option<BufferCollectionProxy>,
+    #[allow(unused)]
+    vsync_receiver: Option<futures::channel::mpsc::UnboundedReceiver<VSyncMessage>>,
 }
 
 impl AppStrategy for FrameBufferAppStrategy {
@@ -153,6 +246,58 @@ impl AppStrategy for FrameBufferAppStrategy {
         let config = self.frame_buffer.get_config();
         config.linear_stride_bytes() as u32
     }
+
+    fn allocate_buffer_collection(
+        &mut self,
+        executor: &mut fasync::Executor,
+    ) -> Result<Option<ClientEnd<BufferCollectionTokenMarker>>, Error> {
+        let (local_token, local_token_request) = create_endpoints::<BufferCollectionTokenMarker>()?;
+        let local_token = local_token.into_proxy()?;
+        let (view_token, view_token_request) = create_endpoints::<BufferCollectionTokenMarker>()?;
+        let (display_token, display_token_request) =
+            create_endpoints::<BufferCollectionTokenMarker>()?;
+
+        // Connect to sysmem and allocate shared buffer collection.
+        let sysmem = connect_to_service::<AllocatorMarker>()?;
+        sysmem.allocate_shared_collection(local_token_request)?;
+
+        // Duplicate local token for view and display.
+        local_token.duplicate(std::u32::MAX, view_token_request)?;
+        local_token.duplicate(std::u32::MAX, display_token_request)?;
+
+        // Ensure that duplicate message has been processed by sysmem.
+        let sync_future = local_token.sync();
+        executor.run_singlethreaded(sync_future).context("sync - run_singlethreaded")?;
+
+        // Frame buffer import of buffer collection.
+        let import_buffer_collection_future =
+            self.frame_buffer.import_buffer_collection(BUFFER_COLLECTION_ID, display_token);
+        executor
+            .run_singlethreaded(import_buffer_collection_future)
+            .context("import_buffer_collection_future - run_singlethreaded")?;
+
+        let set_buffer_collection_constraints_future =
+            self.frame_buffer.set_buffer_collection_constraints(BUFFER_COLLECTION_ID);
+        executor
+            .run_singlethreaded(set_buffer_collection_constraints_future)
+            .context("set_buffer_collection_constraints_future - run_singlethreaded")?;
+
+        //  Bind and set local buffer collection constraints.
+        let (collection_client, collection_request) = create_endpoints::<BufferCollectionMarker>()?;
+        sysmem.bind_shared_collection(
+            ClientEnd::new(local_token.into_channel().unwrap().into_zx_channel()),
+            collection_request,
+        )?;
+        let collection_client = collection_client.into_proxy()?;
+        let mut collection_constraints = BUFFER_COLLECTION_CONSTRAINTS_DEFAULT;
+        let has_constraints = true;
+        collection_client
+            .set_constraints(has_constraints, &mut collection_constraints)
+            .context("Sending buffer constraints to sysmem")?;
+
+        self.buffer_collection_proxy = Some(collection_client);
+        Ok(Some(view_token))
+    }
 }
 
 // Tries to create a framebuffer. If that fails, assume Scenic is running.
@@ -178,7 +323,13 @@ async fn create_app_strategy() -> Result<AppStrategyPtr, Error> {
                 }),
         );
         frame.present(&fb, None)?;
-        Ok::<AppStrategyPtr, Error>(Box::new(FrameBufferAppStrategy { frame_buffer: fb, frame }))
+        Ok::<AppStrategyPtr, Error>(Box::new(FrameBufferAppStrategy {
+            frame_buffer: fb,
+            frame,
+            image_frame: None,
+            buffer_collection_proxy: None,
+            vsync_receiver: None,
+        }))
     }
 }
 

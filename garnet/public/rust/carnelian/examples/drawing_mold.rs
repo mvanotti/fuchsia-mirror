@@ -7,8 +7,8 @@
 #![allow(unused_imports)]
 
 use carnelian::{
-    AnimationMode, App, AppAssistant, PixelSink, Point, ViewAssistant, ViewAssistantContext,
-    ViewAssistantPtr, ViewKey, ViewMode, Size,
+    AnimationMode, App, AppAssistant, PixelSink, Point, Size, ViewAssistant, ViewAssistantContext,
+    ViewAssistantPtr, ViewKey, ViewMode,
 };
 use failure::Error;
 use fuchsia_zircon::{ClockId, Time};

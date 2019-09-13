@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![feature(async_await)]
-
 use failure::{bail, format_err, Error, ResultExt};
 use fdio::watch_directory;
 use fidl::endpoints;
@@ -11,6 +9,7 @@ use fidl_fuchsia_hardware_display::{
     ControllerEvent, ControllerMarker, ControllerProxy, ImageConfig, ImagePlane,
     ProviderSynchronousProxy,
 };
+use fidl_fuchsia_sysmem::BufferCollectionTokenMarker;
 use fuchsia_async::{self as fasync, DurationExt, OnSignals, TimeoutExt};
 use fuchsia_zircon::{
     self as zx,
@@ -21,6 +20,12 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use mapped_vmo::Mapping;
 use std::fs::OpenOptions;
 use std::sync::Arc;
+
+#[cfg(target_arch = "aarch64")]
+const IMAGE_TYPE: u32 = 0;
+// XTiled. Must be consistent with intel-gpu-core.h
+#[cfg(target_arch = "x86_64")]
+const IMAGE_TYPE: u32 = 1;
 
 #[allow(non_camel_case_types, non_upper_case_globals)]
 const ZX_PIXEL_FORMAT_NONE: u32 = 0;
@@ -250,6 +255,63 @@ impl Frame {
     }
 }
 
+pub struct ImageFrame {
+    config: Config,
+    image_id: u64,
+}
+
+impl ImageFrame {
+    async fn import_image(
+        framebuffer: &FrameBuffer,
+        buffer_collection_id: u64,
+        index: u32,
+    ) -> Result<u64, Error> {
+        let pixel_format: u32 = framebuffer.config.format.into();
+        let mut image_config = ImageConfig {
+            width: framebuffer.config.width,
+            height: framebuffer.config.height,
+            pixel_format: pixel_format as u32,
+            type_: IMAGE_TYPE,
+            planes: [
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+            ],
+        };
+
+        let (_status, image_id) = framebuffer
+            .controller
+            .import_image(&mut image_config, buffer_collection_id, index)
+            .await?;
+        Ok(image_id)
+    }
+
+    pub async fn new(
+        framebuffer: &FrameBuffer,
+        buffer_collection_id: u64,
+        index: u32,
+    ) -> Result<ImageFrame, Error> {
+        // import image from buffer collection
+        let image_id = Self::import_image(framebuffer, buffer_collection_id, index)
+            .await
+            .context("ImageFrame::new() import_image")?;
+
+        Ok(ImageFrame { config: framebuffer.get_config(), image_id: image_id })
+    }
+
+    pub fn present(&self, framebuffer: &FrameBuffer) -> Result<(), Error> {
+        let mut layers = std::iter::once(framebuffer.image_layer_id);
+        framebuffer.controller.set_display_layers(self.config.display_id, &mut layers)?;
+        framebuffer
+            .controller
+            .set_layer_image(framebuffer.image_layer_id, self.image_id, 0, 0)
+            .context("ImageFrame::present() set_layer_image")?;
+        framebuffer.controller.apply_config().context("ImageFrame::present() apply_config")?;
+        Ok(())
+    }
+}
+
 pub struct VSyncMessage {
     pub display_id: u64,
     pub timestamp: u64,
@@ -262,6 +324,7 @@ pub struct FrameBuffer {
     controller: ControllerProxy,
     config: Config,
     layer_id: u64,
+    image_layer_id: u64,
 }
 
 impl FrameBuffer {
@@ -325,6 +388,25 @@ impl FrameBuffer {
         Ok(layer_id)
     }
 
+    async fn configure_image_layer(config: Config, proxy: &ControllerProxy) -> Result<u64, Error> {
+        let (_, layer_id) = proxy.create_layer().await?;
+        let pixel_format: u32 = config.format.into();
+        let mut image_config = ImageConfig {
+            width: config.width,
+            height: config.height,
+            pixel_format: pixel_format as u32,
+            type_: IMAGE_TYPE,
+            planes: [
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+            ],
+        };
+        proxy.set_layer_primary_config(layer_id, &mut image_config)?;
+        Ok(layer_id)
+    }
+
     pub async fn new(
         display_index: Option<usize>,
         vsync_sender: Option<futures::channel::mpsc::UnboundedSender<VSyncMessage>>,
@@ -360,6 +442,7 @@ impl FrameBuffer {
         let mut stream = proxy.take_event_stream();
         let config = Self::create_config_from_event_stream(&proxy, &mut stream).await?;
         let layer_id = Self::configure_layer(config, &proxy).await?;
+        let image_layer_id = Self::configure_image_layer(config, &proxy).await?;
 
         if let Some(vsync_sender) = vsync_sender {
             fasync::spawn_local(
@@ -377,7 +460,13 @@ impl FrameBuffer {
             );
         }
 
-        Ok(FrameBuffer { display_controller: device_client, controller: proxy, config, layer_id })
+        Ok(FrameBuffer {
+            display_controller: device_client,
+            controller: proxy,
+            config,
+            layer_id,
+            image_layer_id,
+        })
     }
 
     pub fn get_config(&self) -> Config {
@@ -386,6 +475,51 @@ impl FrameBuffer {
 
     pub fn byte_size(&self) -> usize {
         self.config.height as usize * self.config.linear_stride_bytes()
+    }
+
+    pub async fn import_buffer_collection(
+        &self,
+        buffer_collection_id: u64,
+        buffer_collection: endpoints::ClientEnd<BufferCollectionTokenMarker>,
+    ) -> Result<(), Error> {
+        self.controller.import_buffer_collection(buffer_collection_id, buffer_collection).await?;
+        Ok(())
+    }
+
+    pub async fn set_buffer_collection_constraints(
+        &self,
+        buffer_collection_id: u64,
+    ) -> Result<(), Error> {
+        let pixel_format: u32 = self.config.format.into();
+        let mut image_config = ImageConfig {
+            width: self.config.width,
+            height: self.config.height,
+            pixel_format: pixel_format as u32,
+            type_: IMAGE_TYPE,
+            planes: [
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+                ImagePlane { byte_offset: 0, bytes_per_row: 0 },
+            ],
+        };
+        self.controller
+            .set_buffer_collection_constraints(buffer_collection_id, &mut image_config)
+            .await?;
+        Ok(())
+    }
+
+    pub fn release_buffer_collection(&self, buffer_collection_id: u64) -> Result<(), Error> {
+        self.controller.release_buffer_collection(buffer_collection_id)?;
+        Ok(())
+    }
+
+    pub async fn new_image_frame(
+        &self,
+        buffer_collection_id: u64,
+        index: u32,
+    ) -> Result<ImageFrame, Error> {
+        ImageFrame::new(&self, buffer_collection_id, index).await
     }
 }
 
@@ -399,10 +533,12 @@ mod test {
     use fuchsia_async::{self as fasync};
 
     #[test]
-    fn test_async_new() -> std::result::Result<(), failure::Error> {
+    fn test_async_new_image_frame() -> std::result::Result<(), failure::Error> {
         let mut executor = fasync::Executor::new()?;
         let fb_future = FrameBuffer::new(None, None);
-        executor.run_singlethreaded(fb_future)?;
+        let fb = executor.run_singlethreaded(fb_future)?;
+        let if_future = fb.new_image_frame(0, 0);
+        executor.run_singlethreaded(if_future)?;
         Ok(())
     }
 }
