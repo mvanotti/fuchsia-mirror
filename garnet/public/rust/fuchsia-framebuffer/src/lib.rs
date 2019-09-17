@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![feature(async_await)]
-
 use failure::{bail, format_err, Error, ResultExt};
 use fdio::watch_directory;
 use fidl::endpoints;
@@ -19,6 +17,7 @@ use fuchsia_zircon::{
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use mapped_vmo::Mapping;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::sync::Arc;
 
@@ -114,6 +113,12 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FrameUsage {
+    Cpu,
+    Gpu,
+}
+
 pub struct Frame {
     config: Config,
     pub image_id: u64,
@@ -154,7 +159,7 @@ impl Frame {
         Ok(image_id)
     }
 
-    pub async fn new(framebuffer: &FrameBuffer) -> Result<Frame, Error> {
+    async fn new(framebuffer: &FrameBuffer) -> Result<Frame, Error> {
         let image_vmo = Self::allocate_image_vmo(framebuffer).await?;
         image_vmo
             .set_cache_policy(ZX_CACHE_POLICY_WRITE_COMBINING)
@@ -262,6 +267,9 @@ pub struct FrameBuffer {
     controller: ControllerProxy,
     config: Config,
     layer_id: u64,
+    frames: BTreeMap<u64, Frame>,
+    #[allow(unused)]
+    usage: FrameUsage,
 }
 
 impl FrameBuffer {
@@ -326,6 +334,8 @@ impl FrameBuffer {
     }
 
     pub async fn new(
+        frame_count: usize,
+        usage: FrameUsage,
         display_index: Option<usize>,
         vsync_sender: Option<futures::channel::mpsc::UnboundedSender<VSyncMessage>>,
     ) -> Result<FrameBuffer, Error> {
@@ -377,7 +387,20 @@ impl FrameBuffer {
             );
         }
 
-        Ok(FrameBuffer { display_controller: device_client, controller: proxy, config, layer_id })
+        let mut fb = FrameBuffer {
+            display_controller: device_client,
+            controller: proxy,
+            config,
+            layer_id,
+            frames: BTreeMap::new(),
+            usage,
+        };
+        for _ in 0..frame_count {
+            let frame = Frame::new(&mut fb).await?;
+            fb.frames.insert(frame.image_id, frame);
+        }
+
+        Ok(fb)
     }
 
     pub fn get_config(&self) -> Config {
@@ -387,6 +410,42 @@ impl FrameBuffer {
     pub fn byte_size(&self) -> usize {
         self.config.height as usize * self.config.linear_stride_bytes()
     }
+
+    pub fn get_frame(&self, image_id: u64) -> &Frame {
+        self.frames.get(&image_id).expect("to find image")
+    }
+
+    pub fn get_frame_mut(&mut self, image_id: u64) -> &mut Frame {
+        self.frames.get_mut(&image_id).expect("to find image")
+    }
+
+    pub fn get_image_ids(&self) -> BTreeSet<u64> {
+        self.frames.keys().map(|image_id| *image_id).collect::<BTreeSet<_>>()
+    }
+
+    pub fn present_frame(
+        &mut self,
+        image_id: u64,
+        sender: Option<futures::channel::mpsc::UnboundedSender<u64>>,
+    ) -> Result<(), Error> {
+        let frame = self.get_frame(image_id);
+        self.controller
+            .set_layer_image(self.layer_id, frame.image_id, 0, frame.signal_event_id)
+            .context("Frame::present() set_layer_image")?;
+        self.controller.apply_config().context("Frame::present() apply_config")?;
+        if let Some(signal_sender) = sender.as_ref() {
+            let signal_sender = signal_sender.clone();
+            let image_id = frame.image_id;
+            let local_event = frame.event.duplicate_handle(zx::Rights::SAME_RIGHTS)?;
+            local_event.as_handle_ref().signal(Signals::EVENT_SIGNALED, Signals::NONE)?;
+            fasync::spawn_local(async move {
+                let signals = OnSignals::new(&local_event, Signals::EVENT_SIGNALED);
+                signals.await.expect("to wait");
+                signal_sender.unbounded_send(image_id).expect("send to work");
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Drop for FrameBuffer {
@@ -395,13 +454,13 @@ impl Drop for FrameBuffer {
 
 #[cfg(test)]
 mod test {
-    use crate::FrameBuffer;
-    use fuchsia_async::{self as fasync};
+    use crate::{FrameBuffer, FrameUsage};
+    use fuchsia_async as fasync;
 
     #[test]
     fn test_async_new() -> std::result::Result<(), failure::Error> {
         let mut executor = fasync::Executor::new()?;
-        let fb_future = FrameBuffer::new(None, None);
+        let fb_future = FrameBuffer::new(1, FrameUsage::Cpu, None, None);
         executor.run_singlethreaded(fb_future)?;
         Ok(())
     }
