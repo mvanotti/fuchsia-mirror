@@ -115,19 +115,23 @@ extraction:
     # This step is useful for C/C++ analysis where you want to prepare the environment
     # for the `configure` step without changing the default behavior for that step. 
     after_prepare:
-      - curl -s "https://fuchsia.googlesource.com/fuchsia/+/HEAD/scripts/bootstrap?format=TEXT" | base64 --decode | bash
+      - cd $LGTM_SRC/..
+      - curl -s "https://fuchsia.googlesource.com/jiri/+/HEAD/scripts/bootstrap_jiri?format=TEXT" | base64 --decode | bash -s $LGTM_SRC
+      - cd $LGTM_SRC
+      - $LGTM_SRC/.jiri_root/bin/jiri import -name=integration flower https://fuchsia.googlesource.com/integration
+      - $LGTM_SRC/.jiri_root/bin/jiri update
     # The `configure` step generates build configuration files which the `index` step
     # then uses to build the codebase.
     configure:
       command:
-        - ./scripts/fx set bringup.x64 --no-goma
+        - $LGTM_SRC/scripts/fx set bringup.x64 --no-goma
     # The `index` step builds the code and extracts information during the build
     # process.
     index:
       # Override the autobuild process by specifying a list of custom build commands
       # to use instead. 
       build_command:
-        - ./scripts/fx clean-build
+        - $LGTM_SRC/scripts/fx clean-build
       # Specify that all project or solution files should be used for extraction.
       # Default: false.
       all_solutions: true
