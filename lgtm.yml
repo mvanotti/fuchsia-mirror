@@ -95,56 +95,21 @@ queries:
 # block, with one or more steps.                                                        #
 #########################################################################################
 
-extraction: 
-  # Define settings for C/C++ analysis
-  #####################################
+extraction:
   cpp:
-    # The `prepare` step exists for customization on LGTM.com only.
-    # prepare:
-    #   # The `packages` section is valid for LGTM.com only. It names Ubuntu packages to
-    #   # be installed.
-    #   packages:
-    #     - libxml2-dev
-    #     - libxslt1-dev
-    packages:
-      - git
-      - curl
-      - unzip
-    # Add an `after-prepare` step if you need to run commands after the prepare step.
-    # Each command should be listed on a separate line.
-    # This step is useful for C/C++ analysis where you want to prepare the environment
-    # for the `configure` step without changing the default behavior for that step. 
+    prepare:
+      packages:
+      - "git"
+      - "curl"
+      - "unzip"
     after_prepare:
-      - cd $LGTM_SRC/..
-      - curl -s "https://fuchsia.googlesource.com/jiri/+/HEAD/scripts/bootstrap_jiri?format=TEXT" | base64 --decode | bash -s $LGTM_SRC
-      - cd $LGTM_SRC
-      - $LGTM_SRC/.jiri_root/bin/jiri import -name=integration flower https://fuchsia.googlesource.com/integration
-      - $LGTM_SRC/.jiri_root/bin/jiri update
-    # The `configure` step generates build configuration files which the `index` step
-    # then uses to build the codebase.
+    - "cd $LGTM_SRC/.."
+    - "curl -s \"https://fuchsia.googlesource.com/jiri/+/HEAD/scripts/bootstrap_jiri?format=TEXT\"\
+      \ | base64 --decode | bash -s $LGTM_SRC"
+    - "cd $LGTM_SRC"
+    - "$LGTM_SRC/.jiri_root/bin/jiri import -name=integration flower \"https://fuchsia.googlesource.com/integration\""
+    - "$LGTM_SRC/.jiri_root/bin/jiri update"
     configure:
-      command:
-        - $LGTM_SRC/scripts/fx set bringup.x64 --no-goma
-    # The `index` step builds the code and extracts information during the build
-    # process.
+      command: "$LGTM_SRC/scripts/fx set bringup.x64 --no-goma"
     index:
-      # Override the autobuild process by specifying a list of custom build commands
-      # to use instead. 
-      build_command:
-        - $LGTM_SRC/scripts/fx clean-build
-      # Specify that all project or solution files should be used for extraction.
-      # Default: false.
-      all_solutions: true
-      # Specify a list of one or more project or solution files for extraction.
-      # Default: LGTM chooses the file closest to the root of the repository (this may
-      # fail if there are multiple candidates).
-      # Specify whether or not to perform a NuGet restore for extraction. Default: true.
-      nuget_restore: false
-      # Specify a version of Microsoft Visual Studio to use for MSBuild or any custom
-      # build commands (build_command). For example:
-      #    10 for Visual Studio 2010
-      #    12 for Visual Studio 2012
-      #    14 for Visual Studio 2015
-      #    15 for Visual Studio 2017
-      # Default: read from project files.
-      vstools_version: 10
+      build_command: "$LGTM_SRC/scripts/fx clean-build"
